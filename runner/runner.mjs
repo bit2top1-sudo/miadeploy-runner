@@ -9,6 +9,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const HUBS = (process.env.HUB_URL || "").split(/[\s,]+/).map((s) => s.trim().replace(/\/+$/, "")).filter(Boolean);
 let HUB = HUBS[0] || "";
 const TOKEN = process.env.RUNNER_TOKEN || "";
+const GW_URL = (process.env.GW_URL || "").trim().replace(/\/+$/, "");
+const GW_TOKEN = process.env.GW_TOKEN || "";
+const GWON = !!(GW_URL && GW_TOKEN);
+const OFFLINE_MS = 5 * 60000;
 const TAGS = (process.env.RUNNER_TAGS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
 const SLOTS = Math.max(1, Math.min(32, Number(process.env.RUNNER_SLOTS) || 3));
 const SLOT = Math.max(0, Math.min(99, Number(process.env.RUNNER_SLOT) || 0));
@@ -23,6 +27,7 @@ const NORESPAWN_FILE = "/tmp/mia_norespawn";
 const flag = (f) => { try { writeFileSync(f, String(Date.now())); } catch {} };
 let SHUTDOWN = false;
 let staleSeen = false;
+let running = 0;
 const active = new Map();
 function abortAll() { SHUTDOWN = true; for (const a of active.values()) a.abort(); }
 
@@ -173,23 +178,27 @@ function makeMia(base, key) {
 const caches = new Map();
 const ctl = { sig: null, bad: () => {}, good: () => {}, beatMs: 30000, logMs: 300000, watchMs: 10000 };
 
+async function materialize(dir, files) {
+  mkdirSync(dir, { recursive: true });
+  for (const [path, text] of Object.entries(files || {})) {
+    if (path.includes("..")) continue;
+    const f = join(dir, path);
+    mkdirSync(dirname(f), { recursive: true });
+    writeFileSync(f, text);
+  }
+  if (existsSync(join(dir, "jobs", "package.json"))) {
+    await new Promise((res, rej) => execFile("npm", ["install", "--omit=dev", "--no-audit", "--no-fund", "--prefix", join(dir, "jobs")], { timeout: 300000 }, (e, so, se) => (e ? rej(new Error("npm install failed: " + String(se || e.message).slice(-400))) : res())));
+  }
+  writeFileSync(join(dir, ".ok"), "1");
+}
+
 function prepare(c) {
   const dir = join(tmpdir(), "mia-bundles", c.version || "none");
   if (caches.has(dir)) return caches.get(dir);
   const p = (async () => {
     if (existsSync(join(dir, ".ok"))) return dir;
     const b = await hub("bundle", { job: c.job.id });
-    mkdirSync(dir, { recursive: true });
-    for (const [path, text] of Object.entries(b.files || {})) {
-      if (path.includes("..")) continue;
-      const f = join(dir, path);
-      mkdirSync(dirname(f), { recursive: true });
-      writeFileSync(f, text);
-    }
-    if (existsSync(join(dir, "jobs", "package.json"))) {
-      await new Promise((res, rej) => execFile("npm", ["install", "--omit=dev", "--no-audit", "--no-fund", "--prefix", join(dir, "jobs")], { timeout: 300000 }, (e, so, se) => (e ? rej(new Error("npm install failed: " + String(se || e.message).slice(-400))) : res())));
-    }
-    writeFileSync(join(dir, ".ok"), "1");
+    await materialize(dir, b.files);
     return dir;
   })();
   caches.set(dir, p);
@@ -263,9 +272,249 @@ async function runJob(c) {
   }
 }
 
-async function main() {
-  if (!HUB || !TOKEN) { console.error("HUB_URL and RUNNER_TOKEN are required."); process.exit(2); }
+
+export const gwWsUrl = (u) => String(u).trim().replace(/\/+$/, "").replace(/^http/i, "ws") + "/rt";
+
+const gw = { ws: null, up: false, stop: false, draining: false, deadline: 0, lastUp: Date.now(), rid: 0, reps: new Map(), jobs: new Set(), pending: new Map() };
+
+function gwSend(m) {
+  if (!gw.ws || gw.ws.readyState !== 1) return false;
+  try { gw.ws.send(JSON.stringify(m)); return true; } catch { return false; }
+}
+
+function gwDrain() {
+  gw.draining = true;
+  gwSend({ t: "drain" });
+}
+
+function gwReq(id, t, body) {
+  return new Promise((res, rej) => {
+    const rid = ++gw.rid;
+    const timer = setTimeout(() => { gw.reps.delete(rid); rej(new Error("The gateway did not answer in time.")); }, 20000);
+    gw.reps.set(rid, { res, rej, timer });
+    if (!gwSend({ t, rid, id, ...body })) { clearTimeout(timer); gw.reps.delete(rid); rej(new Error("The gateway is offline.")); }
+  });
+}
+
+function gwBundle(hash) {
+  if (!hash) return Promise.reject(new Error("No function bundle has been published for this site."));
+  const dir = join(tmpdir(), "mia-bundles", "gw-" + hash);
+  if (caches.has(dir)) return caches.get(dir);
+  const p = (async () => {
+    if (existsSync(join(dir, ".ok"))) return dir;
+    const text = await new Promise((res, rej) => {
+      const e = { parts: [], got: 0, res, rej, timer: setTimeout(() => { gw.pending.delete(hash); rej(new Error("Timed out waiting for the function bundle.")); }, 60000) };
+      gw.pending.set(hash, e);
+      if (!gwSend({ t: "need", hash })) { clearTimeout(e.timer); gw.pending.delete(hash); rej(new Error("The gateway is offline.")); }
+    });
+    let files = null;
+    try { files = JSON.parse(text).files; } catch {}
+    if (!files || typeof files !== "object") throw new Error("The function bundle was unreadable.");
+    await materialize(dir, files);
+    return dir;
+  })();
+  caches.set(dir, p);
+  p.catch(() => caches.delete(dir));
+  return p;
+}
+
+function gwBundlePart(m) {
+  const e = gw.pending.get(m.hash);
+  if (!e) return;
+  if (!m.parts) { clearTimeout(e.timer); gw.pending.delete(m.hash); e.rej(new Error("The function bundle is not available on the gateway.")); return; }
+  e.parts[m.part] = m.data;
+  e.got++;
+  if (e.got >= m.parts) { clearTimeout(e.timer); gw.pending.delete(m.hash); e.res(e.parts.join("")); }
+}
+
+async function runGwJob(m) {
+  const id = m.id;
+  const ac = new AbortController();
+  active.set(id, ac);
+  gw.jobs.add(id);
+  let buf = "";
+  const push = (line) => {
+    buf = (buf + line + "\n").slice(-7000);
+    if (!QUIET) orig.log("[" + m.fn + "]", line);
+  };
+  const out = (...a) => push(a.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" "));
+  const t0 = Date.now();
+  let timer;
+  let res;
+  try {
+    res = await als.run({ push }, async () => {
+      const dir = await gwBundle(m.hash);
+      const file = join(dir, "jobs", m.fn + ".mjs");
+      if (!existsSync(file)) throw new Error("jobs/" + m.fn + ".mjs was not found in the deployed zip.");
+      const mod = await import(pathToFileURL(file).href);
+      const fn = mod.default || mod.run;
+      if (typeof fn !== "function") throw new Error("jobs/" + m.fn + ".mjs must export a default function.");
+      const noHub = () => Promise.reject(new Error("hub is not available to gateway functions."));
+      const ctx = {
+        mia: null,
+        hub: noHub,
+        log: out,
+        signal: ac.signal,
+        secrets: m.secrets || {},
+        site: m.site,
+        job: { id, name: m.fn, attempt: 1, project: "" },
+        kv: { get: (key) => gwReq(id, "kv.get", { key }), set: (key, value) => gwReq(id, "kv.set", { key, value }) },
+        form: (name, fields) => gwReq(id, "form", { name, fields }),
+        hit: (name) => gwReq(id, "hit", { name }),
+      };
+      const work = Promise.resolve(fn(m.payload, ctx));
+      const limit = new Promise((_, rej) => { timer = setTimeout(() => { rej(new Error("Timed out after " + (m.timeout || 90) + "s.")); ac.abort(); }, (Number(m.timeout) || 90) * 1000); });
+      const stop = new Promise((_, rej) => { if (ac.signal.aborted) rej(new Error("Canceled.")); else ac.signal.addEventListener("abort", () => rej(new Error("Canceled.")), { once: true }); });
+      const result = await Promise.race([work, limit, stop]);
+      return { ok: true, result: result === undefined ? null : result };
+    });
+  } catch (e) {
+    res = { ok: false, error: String(e && e.stack ? e.stack : e).slice(0, 4000) };
+  } finally { clearTimeout(timer); active.delete(id); gw.jobs.delete(id); }
+  let frame = { t: "done", id, ok: res.ok, log: buf, ms: Date.now() - t0 };
+  if (res.ok) {
+    let size = 0;
+    try { size = JSON.stringify(res.result).length; } catch { size = Infinity; }
+    if (size > 400000) frame = { ...frame, ok: false, error: "The result is larger than 400000 characters." };
+    else frame.result = res.result;
+  } else frame.error = res.error;
+  gwSend(frame);
+}
+
+function gwStartJob(m) {
+  if (!m.id) return;
+  gwSend({ t: "ack", id: m.id });
+  if (m.fn === "sys.ping") { gwSend({ t: "done", id: m.id, ok: true, result: { pong: Date.now() }, log: "", ms: 0 }); return; }
+  running++;
+  runGwJob(m).catch((e) => log("gateway job failed:", e.message)).finally(() => { running--; });
+}
+
+function gwOnMsg(m) {
+  if (m.t === "job") gwStartJob(m);
+  else if (m.t === "cancel") { const a = active.get(m.id); if (a) a.abort(); }
+  else if (m.t === "bundle") gwBundlePart(m);
+  else if (m.t === "rep") {
+    const p = gw.reps.get(m.rid);
+    if (!p) return;
+    gw.reps.delete(m.rid);
+    clearTimeout(p.timer);
+    if (m.ok) p.res(m.value); else p.rej(new Error(String(m.error || "The request failed.")));
+  }
+}
+
+function gwOnce() {
+  return new Promise((resolve) => {
+    let ws;
+    let finished = false;
+    let timer = null;
+    let lastRx = Date.now();
+    const end = () => {
+      if (finished) return;
+      finished = true;
+      clearInterval(timer);
+      const was = gw.up;
+      gw.up = false;
+      gw.ws = null;
+      if (was) gw.lastUp = Date.now();
+      for (const id of gw.jobs) { const a = active.get(id); if (a) a.abort(); }
+      for (const [k, p] of gw.reps) { clearTimeout(p.timer); p.rej(new Error("The gateway connection was lost.")); gw.reps.delete(k); }
+      for (const [k, p] of gw.pending) { clearTimeout(p.timer); p.rej(new Error("The gateway connection was lost.")); gw.pending.delete(k); }
+      resolve(was);
+    };
+    try { ws = new WebSocket(gwWsUrl(GW_URL), ["mia." + GW_TOKEN]); } catch (e) { log("gateway connect failed:", String((e && e.message) || e).slice(0, 120)); return end(); }
+    gw.ws = ws;
+    ws.addEventListener("open", () => {
+      lastRx = Date.now();
+      try { ws.send(JSON.stringify({ t: "hello", id: ID, slot: SLOT, slots: SLOTS, deadline: gw.deadline, v: 1 })); } catch {}
+    });
+    ws.addEventListener("message", (ev) => {
+      lastRx = Date.now();
+      const d = typeof ev.data === "string" ? ev.data : "";
+      if (!d || d === "pong") return;
+      let m = null;
+      try { m = JSON.parse(d); } catch {}
+      if (!m) return;
+      if (m.t === "ready") {
+        gw.up = true;
+        gw.lastUp = Date.now();
+        log("gateway connected");
+        if (gw.draining) gwSend({ t: "drain" });
+        return;
+      }
+      gwOnMsg(m);
+    });
+    ws.addEventListener("close", end);
+    ws.addEventListener("error", end);
+    timer = setInterval(() => {
+      if (Date.now() - lastRx > 100000) { try { ws.close(); } catch {} end(); return; }
+      try { ws.send("ping"); } catch {}
+    }, 30000);
+  });
+}
+
+async function gwLoop() {
+  let fails = 0;
+  while (!gw.stop) {
+    const was = await gwOnce();
+    if (gw.stop) return;
+    fails = was ? 0 : fails + 1;
+    if (Date.now() - gw.lastUp > OFFLINE_MS) {
+      orig.log("::error::The gateway has been unreachable for " + Math.round(OFFLINE_MS / 60000) + " minutes, stopping this runner.");
+      flag(NORESPAWN_FILE);
+      abortAll();
+      process.exit(5);
+    }
+    await sleep(jitter(Math.min(30000, 1000 * 2 ** Math.min(fails, 5))));
+  }
+}
+
+function gwStart() {
+  if (typeof WebSocket === "undefined") { log("This runner needs Node 22 or newer for WebSocket support."); process.exit(2); }
+  gw.lastUp = Date.now();
+  gwLoop();
+}
+
+async function gwOnly() {
+  QUIET = process.env.RUNNER_QUIET === "1" || (GHA && process.env.RUNNER_QUIET !== "0");
+  routeConsole(als, orig, QUIET);
+  const startedAt = Date.now();
+  const life = (Number(process.env.RUNNER_LIFE_MINUTES) || (GHA ? 300 : 0)) * 60000;
+  const DEADLINE = life ? startedAt + life : 0;
+  const HARD = DEADLINE ? Math.min(DEADLINE + 15 * 60000, startedAt + 345 * 60000) : 0;
+  gw.deadline = DEADLINE;
+  flag(STARTED_FILE);
+  const bye = async (why) => {
+    if (SHUTDOWN) return;
+    log(why);
+    abortAll();
+    gwDrain();
+    const t = Date.now();
+    while (running > 0 && Date.now() - t < 6000) await sleep(200);
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => bye("SIGTERM received, stopping"));
+  process.on("SIGINT", () => bye("SIGINT received, stopping"));
+  log("runner", ID, "online", KIND, "gateway", "slots", SLOTS, QUIET ? "quiet" : "", DEADLINE ? "until " + new Date(DEADLINE).toISOString() : "");
+  gwStart();
+  let stopping = false;
+  while (true) {
+    const now = Date.now();
+    if (!stopping && DEADLINE && now >= DEADLINE) { stopping = true; log("lifetime reached, draining"); gwDrain(); }
+    if (stopping && running === 0) break;
+    if (stopping && HARD && now >= HARD && !SHUTDOWN) { log("drain limit reached, releasing the rest"); abortAll(); }
+    await sleep(1000);
+  }
+  gw.stop = true;
+  try { if (gw.ws) gw.ws.close(); } catch {}
+  process.exit(0);
+}
+
+export async function main() {
+  const HUBON = !!(HUB && TOKEN);
+  if (!HUBON && !GWON) { console.error("HUB_URL and RUNNER_TOKEN, or GW_URL and GW_TOKEN, are required."); process.exit(2); }
   delete process.env.RUNNER_TOKEN;
+  delete process.env.GW_TOKEN;
+  if (!HUBON) return gwOnly();
   const DIRECT_OFF = process.env.RUNNER_DIRECT === "0";
   const helloBody = () => ({ tags: TAGS, kind: KIND, slots: SLOTS, event: EVENT, slot: SLOT, epoch: Number(process.env.RUNNER_EPOCH) || 0, v: 7 });
 
@@ -346,9 +595,9 @@ async function main() {
   const DEADLINE = FLEET ? Number(cfg.deadline) || startedAt + 300 * 60000 : 0;
   const HARD = FLEET ? Math.min(DEADLINE + 15 * 60000, startedAt + 345 * 60000) : 0;
   flag(STARTED_FILE);
+  if (GWON) { gw.deadline = DEADLINE; gwStart(); }
   log("runner", ID, "online", KIND, "slots", SLOTS, "tags", TAGS.join(",") || "none", "keepAlive", cfg.keepAlive, SIG ? "direct" : "hub-poll", QUIET ? "quiet" : "", FLEET ? "slot " + SLOT + " until " + new Date(DEADLINE).toISOString() : "");
 
-  let running = 0;
   let stopping = false;
   let lastBusy = Date.now();
   let lastTick = 0;
@@ -391,6 +640,7 @@ async function main() {
     if (staleSeen && !SHUTDOWN) { flag(NORESPAWN_FILE); await shutdown("This start was replaced by a newer one, releasing jobs."); }
     if (!stopping && FLEET && now >= DEADLINE) { stopping = true; log("lifetime reached, draining"); }
     else if (!stopping && !FLEET && MAX_MS && now - startedAt > MAX_MS) { stopping = true; log("lifetime reached, draining"); }
+    if (stopping && GWON) gwDrain();
     if (stopping && running === 0) break;
     if (stopping && FLEET && !SHUTDOWN && now >= HARD) { log("drain limit reached, releasing the rest"); abortAll(); }
     if (!FLEET && GHA && !cfg.keepAlive && running === 0 && now - lastBusy > cfg.idleSeconds * 1000) { log("idle, exiting"); break; }
