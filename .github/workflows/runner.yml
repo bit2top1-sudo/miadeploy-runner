@@ -1,0 +1,61 @@
+name: runner
+run-name: "slot ${{ inputs.slot || 0 }} e${{ inputs.epoch || 0 }} ${{ github.event_name }}"
+on:
+  workflow_dispatch:
+    inputs:
+      slot:
+        required: false
+        type: string
+      epoch:
+        required: false
+        type: string
+  schedule:
+    - cron: "*/15 * * * *"
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: "miadeploy-${{ inputs.slot || 'x' }}"
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node runner/runner.mjs
+        env:
+          HUB_URL: ${{ secrets.HUB_URL }}
+          RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+          RUNNER_KIND: gha
+          RUNNER_SLOTS: "20"
+          RUNNER_SLOT: ${{ inputs.slot }}
+          RUNNER_EPOCH: ${{ inputs.epoch }}
+      - name: Respawn this slot
+        if: always()
+        env:
+          HUB_URL: ${{ secrets.HUB_URL }}
+          RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          SLOT: ${{ inputs.slot }}
+          EPOCH: ${{ inputs.epoch }}
+        run: |
+          S="$SLOT"; E="$EPOCH"
+          if [ -z "$S" ] || [ "$S" = "0" ]; then echo "respawn: not a fleet run"; exit 0; fi
+          if [ -f /tmp/mia_norespawn ]; then echo "respawn: skipped, this start was replaced or rejected"; exit 0; fi
+          if [ ! -f /tmp/mia_started ] || [ $(( $(date +%s) - $(date -r /tmp/mia_started +%s) )) -lt 150 ]; then echo "respawn: the run was short, waiting 120s"; sleep 120; fi
+          BODY=$(printf '{"slot":%s,"epoch":%s,"run":"%s"}' "$S" "$E" "$GITHUB_RUN_ID")
+          DONE=0
+          for H in $(echo "$HUB_URL" | tr ',' ' '); do
+            CODE=$(curl -s -o /tmp/respawn_resp -w "%{http_code}" -m 25 -X POST -H "Authorization: Bearer $RUNNER_TOKEN" -H "Content-Type: application/json" -d "$BODY" "$H/api/runner/respawn")
+            echo "respawn: $H HTTP $CODE $(head -c 200 /tmp/respawn_resp 2>/dev/null)"
+            case "$CODE" in 2??|409) DONE=1; break;; esac
+          done
+          if [ "$DONE" = "0" ]; then
+            BODY2=$(printf '{"ref":"%s","inputs":{"slot":"%s","epoch":"%s"}}' "$GITHUB_REF_NAME" "$S" "$E")
+            CODE=$(curl -s -o /tmp/respawn_resp -w "%{http_code}" -m 25 -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -d "$BODY2" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/runner.yml/dispatches")
+            echo "respawn: direct dispatch HTTP $CODE $(head -c 200 /tmp/respawn_resp 2>/dev/null)"
+          fi
