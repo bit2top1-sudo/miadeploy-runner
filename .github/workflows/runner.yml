@@ -25,11 +25,30 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
+      - name: Reconcile gateway fleet
+        if: github.event_name == 'schedule'
+        continue-on-error: true
+        env:
+          GW_URL: ${{ secrets.GW_URL }}
+          GW_TOKEN: ${{ secrets.GW_RUNNER_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "$GW_URL" ] || [ -z "$GW_TOKEN" ]; then echo "gateway fleet: not configured"; exit 0; fi
+          P=$(curl -s -m 20 -H "Authorization: Bearer $GW_TOKEN" "$GW_URL/rt/presence")
+          if [ "$(echo "$P" | jq -r '.on | tostring' 2>/dev/null)" != "true" ]; then echo "gateway fleet: off or unreachable"; exit 0; fi
+          E=$(echo "$P" | jq -r '.epoch'); N=$(echo "$P" | jq -r '.slots')
+          for S in $(seq 1 "$N"); do
+            if echo "$P" | jq -e --argjson s "$S" '.connected | index($s)' >/dev/null; then continue; fi
+            CODE=$(curl -s -o /tmp/dispatch_resp -w "%{http_code}" -m 25 -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -d "$(printf '{"ref":"%s","inputs":{"slot":"%s","epoch":"%s"}}' "$GITHUB_REF_NAME" "$S" "$E")" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/runner.yml/dispatches")
+            echo "gateway fleet: slot $S missing, dispatch HTTP $CODE"
+          done
       - run: node runner/runner.mjs
         env:
           HUB_URL: ${{ secrets.HUB_URL }}
           RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+          GW_URL: ${{ secrets.GW_URL }}
+          GW_TOKEN: ${{ secrets.GW_RUNNER_TOKEN }}
           RUNNER_KIND: gha
           RUNNER_SLOTS: "20"
           RUNNER_SLOT: ${{ inputs.slot }}
@@ -40,6 +59,8 @@ jobs:
           HUB_URL: ${{ secrets.HUB_URL }}
           RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
           GH_TOKEN: ${{ github.token }}
+          GW_URL: ${{ secrets.GW_URL }}
+          GW_TOKEN: ${{ secrets.GW_RUNNER_TOKEN }}
           SLOT: ${{ inputs.slot }}
           EPOCH: ${{ inputs.epoch }}
         run: |
@@ -47,6 +68,20 @@ jobs:
           if [ -z "$S" ] || [ "$S" = "0" ]; then echo "respawn: not a fleet run"; exit 0; fi
           if [ -f /tmp/mia_norespawn ]; then echo "respawn: skipped, this start was replaced or rejected"; exit 0; fi
           if [ ! -f /tmp/mia_started ] || [ $(( $(date +%s) - $(date -r /tmp/mia_started +%s) )) -lt 150 ]; then echo "respawn: the run was short, waiting 120s"; sleep 120; fi
+          if [ -n "$GW_URL" ] && [ -n "$GW_TOKEN" ]; then
+            P=$(curl -s -m 15 -H "Authorization: Bearer $GW_TOKEN" "$GW_URL/rt/presence")
+            ON=$(echo "$P" | jq -r 'if has("on") then (.on | tostring) else empty end' 2>/dev/null)
+            PE=$(echo "$P" | jq -r '.epoch // empty' 2>/dev/null)
+            if [ -n "$ON" ]; then
+              if [ "$ON" = "true" ] && [ "$PE" = "$E" ]; then
+                CODE=$(curl -s -o /tmp/respawn_resp -w "%{http_code}" -m 25 -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -d "$(printf '{"ref":"%s","inputs":{"slot":"%s","epoch":"%s"}}' "$GITHUB_REF_NAME" "$S" "$E")" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/runner.yml/dispatches")
+                echo "respawn: gateway successor HTTP $CODE $(head -c 200 /tmp/respawn_resp 2>/dev/null)"
+                case "$CODE" in 2??) exit 0;; esac
+              else
+                echo "respawn: the gateway fleet is off or this start is old, not replacing it"; exit 0
+              fi
+            fi
+          fi
           BODY=$(printf '{"slot":%s,"epoch":%s,"run":"%s"}' "$S" "$E" "$GITHUB_RUN_ID")
           DONE=0
           for H in $(echo "$HUB_URL" | tr ',' ' '); do
